@@ -129,10 +129,9 @@ func init() {
 				if err != nil {
 					return err
 				}
-				ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-				err = p.Handler.Open(ctx, vals...)
-				stop()
-				return err
+				ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+				defer cancel()
+				return p.Handler.Open(ctx, vals...)
 			},
 		},
 		Disconnect: {
@@ -268,6 +267,8 @@ func init() {
 				if err != nil {
 					return err
 				}
+				// save edited buffer to history
+				p.Handler.IO().Save(string(n))
 				buf.Reset(n)
 				return nil
 			},
@@ -426,7 +427,6 @@ func init() {
 					}
 					p.Handler.SetTiming(b)
 				}
-
 				setting := "off"
 				if p.Handler.GetTiming() {
 					setting = "on"
@@ -450,7 +450,6 @@ func init() {
 			Aliases: map[string]string{"out": ""},
 			Process: func(p *Params) error {
 				if out := p.Handler.GetOutput(); out != nil {
-					out.Close()
 					p.Handler.SetOutput(nil)
 				}
 				params, err := p.GetAll(true)
@@ -463,7 +462,7 @@ func init() {
 				}
 				var out io.WriteCloser
 				if pipe[0] == '|' {
-					out, err = env.Pipe(pipe[1:])
+					out, _, err = env.Pipe(pipe[1:])
 				} else {
 					out, err = os.OpenFile(pipe, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o644)
 				}
@@ -710,6 +709,12 @@ func init() {
 				case !strings.Contains(mask, "%"):
 					p.Handler.Print(mask)
 				default:
+					if field == "time" {
+						val = fmt.Sprintf("%q", val)
+						if tfmt := env.GoTime(); tfmt != val {
+							val = fmt.Sprintf("%s (%q)", val, tfmt)
+						}
+					}
 					p.Handler.Print(mask, val)
 				}
 				return nil
@@ -731,14 +736,16 @@ func init() {
 				"l[+]":   "list databases",
 			},
 			Process: func(p *Params) error {
-				m, err := p.Handler.MetadataWriter()
+				ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+				defer cancel()
+				m, err := p.Handler.MetadataWriter(ctx)
 				if err != nil {
 					return err
 				}
 				verbose := strings.ContainsRune(p.Name, '+')
 				showSystem := strings.ContainsRune(p.Name, 'S')
 				name := strings.TrimRight(p.Name, "S+")
-				pattern, err := p.Get(false)
+				pattern, err := p.Get(true)
 				if err != nil {
 					return err
 				}
@@ -759,6 +766,62 @@ func init() {
 				case "l":
 					return m.ListAllDbs(pattern, verbose)
 				}
+				return nil
+			},
+		},
+		Copy: {
+			Section: SectionInputOutput,
+			Name:    "copy",
+			Desc:    "copy data from/to a table,[SRC_URL] [DST_URL] [SRC] [DST]",
+			Process: func(p *Params) error {
+				stdout, stderr := p.Handler.IO().Stdout, p.Handler.IO().Stderr
+				srcURLstr, err := p.Get(true)
+				if err != nil {
+					return err
+				}
+				srcURL, err := dburl.Parse(srcURLstr)
+				if err != nil {
+					return err
+				}
+				dstURLstr, err := p.Get(true)
+				if err != nil {
+					return err
+				}
+				dstURL, err := dburl.Parse(dstURLstr)
+				if err != nil {
+					return err
+				}
+				src, err := p.Get(true)
+				if err != nil {
+					return err
+				}
+				dst, err := p.Get(true)
+				if err != nil {
+					return err
+				}
+				srcDB, err := drivers.Open(srcURL, stdout, stderr)
+				if err != nil {
+					return err
+				}
+				defer srcDB.Close()
+				dstDB, err := drivers.Open(dstURL, stdout, stderr)
+				if err != nil {
+					return err
+				}
+				defer dstDB.Close()
+				ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+				defer cancel()
+				// get the result set
+				r, err := srcDB.QueryContext(ctx, src)
+				if err != nil {
+					return err
+				}
+				defer r.Close()
+				n, err := drivers.Copy(ctx, dstURL, stdout, stderr, r, dst)
+				if err != nil {
+					return err
+				}
+				p.Handler.Print("COPY %d", n)
 				return nil
 			},
 		},

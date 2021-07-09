@@ -54,10 +54,13 @@ type Driver struct {
 	RequirePreviousPassword bool
 	// LexerName is the name of the syntax lexer to use.
 	LexerName string
+	// UseColumnTypes will cause the driver's ColumnTypes func to be used for
+	// types.
+	UseColumnTypes bool
 	// ForceParams will be used to force parameters if defined.
 	ForceParams func(*dburl.URL)
 	// Open will be used by Open if defined.
-	Open func(*dburl.URL) (func(string, string) (*sql.DB, error), error)
+	Open func(*dburl.URL, func() io.Writer, func() io.Writer) (func(string, string) (*sql.DB, error), error)
 	// Version will be used by Version if defined.
 	Version func(context.Context, DB) (string, error)
 	// User will be used by User if defined.
@@ -98,6 +101,8 @@ type Driver struct {
 	NewMetadataWriter func(db DB, w io.Writer, opts ...metadata.ReaderOption) metadata.Writer
 	// NewCompleter returns a db auto-completer.
 	NewCompleter func(db DB, opts ...completer.Option) readline.AutoCompleter
+	// Copy rows into the database table
+	Copy func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error)
 }
 
 // drivers is the map of drivers funcs.
@@ -132,6 +137,14 @@ func Registered(name string) bool {
 	return ok
 }
 
+// UseColumnTypes returns whether or not a specific driver uses column types.
+func UseColumnTypes(u *dburl.URL) bool {
+	if d, ok := drivers[u.Driver]; ok {
+		return d.UseColumnTypes
+	}
+	return false
+}
+
 // ForceParams forces parameters on the supplied DSN for the registered driver.
 func ForceParams(u *dburl.URL) {
 	d, ok := drivers[u.Driver]
@@ -141,7 +154,7 @@ func ForceParams(u *dburl.URL) {
 }
 
 // Open opens a sql.DB connection for the registered driver.
-func Open(u *dburl.URL) (*sql.DB, error) {
+func Open(u *dburl.URL, stdout, stderr func() io.Writer) (*sql.DB, error) {
 	d, ok := drivers[u.Driver]
 	if !ok {
 		return nil, WrapErr(u.Driver, text.ErrDriverNotAvailable)
@@ -149,7 +162,7 @@ func Open(u *dburl.URL) (*sql.DB, error) {
 	f := sql.Open
 	if d.Open != nil {
 		var err error
-		if f, err = d.Open(u); err != nil {
+		if f, err = d.Open(u, stdout, stderr); err != nil {
 			return nil, WrapErr(u.Driver, err)
 		}
 	}
@@ -430,14 +443,8 @@ func ForceQueryParameters(params []string) func(*dburl.URL) {
 	}
 }
 
-// NextResultSet is a wrapper around the go1.8 introduced
-// sql.Rows.NextResultSet call.
-func NextResultSet(q *sql.Rows) bool {
-	return q.NextResultSet()
-}
-
 // NewMetadataReader wraps creating a new database introspector for the specified driver.
-func NewMetadataReader(u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Reader, error) {
+func NewMetadataReader(ctx context.Context, u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Reader, error) {
 	d, ok := drivers[u.Driver]
 	if !ok || d.NewMetadataReader == nil {
 		return nil, fmt.Errorf(text.NotSupportedByDriver, `describe commands`)
@@ -446,7 +453,7 @@ func NewMetadataReader(u *dburl.URL, db DB, w io.Writer, opts ...metadata.Reader
 }
 
 // NewMetadataWriter wraps creating a new database metadata printer for the specified driver.
-func NewMetadataWriter(u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Writer, error) {
+func NewMetadataWriter(ctx context.Context, u *dburl.URL, db DB, w io.Writer, opts ...metadata.ReaderOption) (metadata.Writer, error) {
 	d, ok := drivers[u.Driver]
 	if !ok {
 		return nil, fmt.Errorf(text.NotSupportedByDriver, `describe commands`)
@@ -461,7 +468,7 @@ func NewMetadataWriter(u *dburl.URL, db DB, w io.Writer, opts ...metadata.Reader
 	return newMetadataWriter(db, w), nil
 }
 
-func NewCompleter(u *dburl.URL, db DB, opts ...completer.Option) readline.AutoCompleter {
+func NewCompleter(ctx context.Context, u *dburl.URL, db DB, readerOpts []metadata.ReaderOption, opts ...completer.Option) readline.AutoCompleter {
 	d, ok := drivers[u.Driver]
 	if !ok {
 		return nil
@@ -472,15 +479,107 @@ func NewCompleter(u *dburl.URL, db DB, opts ...completer.Option) readline.AutoCo
 	if d.NewMetadataReader == nil {
 		return nil
 	}
-	r := d.NewMetadataReader(db,
+	// prepend to allow to override default options
+	readerOpts = append([]metadata.ReaderOption{
 		// this needs to be relatively low, since autocomplete is very interactive
-		metadata.WithTimeout(3*time.Second),
+		metadata.WithTimeout(3 * time.Second),
 		metadata.WithLimit(1000),
-	)
-	// prepend to allow to override both reader and db
+	}, readerOpts...)
 	opts = append([]completer.Option{
-		completer.WithReader(r),
+		completer.WithReader(d.NewMetadataReader(db, readerOpts...)),
 		completer.WithDB(db),
 	}, opts...)
 	return completer.NewDefaultCompleter(opts...)
+}
+
+// Copy the result set to the destination sql.DB.
+func Copy(ctx context.Context, u *dburl.URL, stdout, stderr func() io.Writer, rows *sql.Rows, table string) (int64, error) {
+	d, ok := drivers[u.Driver]
+	if !ok {
+		return 0, WrapErr(u.Driver, text.ErrDriverNotAvailable)
+	}
+	if d.Copy == nil {
+		return 0, fmt.Errorf(text.NotSupportedByDriver, `copy`)
+	}
+	db, err := Open(u, stdout, stderr)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	return d.Copy(ctx, db, rows, table)
+}
+
+func CopyWithInsert(placeholder func(int) string) func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error) {
+	if placeholder == nil {
+		placeholder = func(n int) string { return fmt.Sprintf("$%d", n) }
+	}
+	return func(ctx context.Context, db *sql.DB, rows *sql.Rows, table string) (int64, error) {
+		columns, err := rows.Columns()
+		if err != nil {
+			return 0, fmt.Errorf("failed to fetch source rows columns: %w", err)
+		}
+		clen := len(columns)
+		query := table
+		if !strings.HasPrefix(strings.ToLower(query), "insert into") {
+			leftParen := strings.IndexRune(table, '(')
+			if leftParen == -1 {
+				colStmt, err := db.PrepareContext(ctx, "SELECT * FROM "+table+" WHERE 1=0")
+				if err != nil {
+					return 0, fmt.Errorf("failed to prepare query to determine target table columns: %w", err)
+				}
+				defer colStmt.Close()
+				colRows, err := colStmt.QueryContext(ctx)
+				if err != nil {
+					return 0, fmt.Errorf("failed to execute query to determine target table columns: %w", err)
+				}
+				columns, err := colRows.Columns()
+				if err != nil {
+					return 0, fmt.Errorf("failed to fetch target table columns: %w", err)
+				}
+				table += "(" + strings.Join(columns, ", ") + ")"
+			}
+			// TODO if the db supports multiple rows per insert, create batches of 100 rows
+			placeholders := make([]string, clen)
+			for i := 0; i < clen; i++ {
+				placeholders[i] = placeholder(i + 1)
+			}
+			query = "INSERT INTO " + table + " VALUES (" + strings.Join(placeholders, ", ") + ")"
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return 0, fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		stmt, err := tx.PrepareContext(ctx, query)
+		if err != nil {
+			return 0, fmt.Errorf("failed to prepare insert query: %w", err)
+		}
+		defer stmt.Close()
+		values := make([]interface{}, clen)
+		for i := 0; i < clen; i++ {
+			values[i] = new(interface{})
+		}
+		var n int64
+		for rows.Next() {
+			err = rows.Scan(values...)
+			if err != nil {
+				return n, fmt.Errorf("failed to scan row: %w", err)
+			}
+			res, err := stmt.ExecContext(ctx, values...)
+			if err != nil {
+				return n, fmt.Errorf("failed to exec insert: %w", err)
+			}
+			rn, err := res.RowsAffected()
+			if err != nil {
+				return n, fmt.Errorf("failed to check rows affected: %w", err)
+			}
+			n += rn
+		}
+		// TODO if using batches, flush the last batch,
+		// TODO prepare another statement and count remaining rows
+		err = tx.Commit()
+		if err != nil {
+			return n, fmt.Errorf("failed to commit transaction: %w", err)
+		}
+		return n, rows.Err()
+	}
 }

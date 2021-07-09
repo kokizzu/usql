@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
@@ -19,12 +20,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/alecthomas/chroma"
 	"github.com/alecthomas/chroma/formatters"
 	"github.com/alecthomas/chroma/styles"
 	"github.com/xo/dburl"
+	"github.com/xo/dburl/passfile"
 	"github.com/xo/tblfmt"
 	"github.com/xo/usql/drivers"
 	"github.com/xo/usql/drivers/completer"
@@ -255,21 +258,19 @@ func (h *Handler) Run() error {
 				lastErr = WrapErr(cmd, err)
 				switch {
 				case err == text.ErrUnknownCommand:
-					fmt.Fprintf(stderr, text.InvalidCommand, cmd)
+					fmt.Fprintln(stderr, fmt.Sprintf(text.InvalidCommand, cmd))
 				case err == text.ErrMissingRequiredArgument:
-					fmt.Fprintf(stderr, text.MissingRequiredArg, cmd)
+					fmt.Fprintln(stderr, fmt.Sprintf(text.MissingRequiredArg, cmd))
 				default:
-					fmt.Fprintf(stderr, "error: %v", err)
+					fmt.Fprintln(stderr, "error:", err)
 				}
-				fmt.Fprintln(stderr)
 				continue
 			}
 			// run
 			opt, err = r.Run(h)
 			if err != nil && err != rline.ErrInterrupt {
 				lastErr = WrapErr(cmd, err)
-				fmt.Fprintf(stderr, "error: %v", err)
-				fmt.Fprintln(stderr)
+				fmt.Fprintln(stderr, "error:", err)
 				continue
 			}
 			// print unused command parameters
@@ -278,14 +279,12 @@ func (h *Handler) Run() error {
 					return true, s, nil
 				})
 				if err != nil {
-					fmt.Fprintf(stderr, "error: %v", err)
-					fmt.Fprintln(stderr)
+					fmt.Fprintln(stderr, "error:", err)
 				}
 				if !ok {
 					break
 				}
-				fmt.Fprintf(stdout, text.ExtraArgumentIgnored, cmd, arg)
-				fmt.Fprintln(stdout)
+				fmt.Fprintln(stdout, fmt.Sprintf(text.ExtraArgumentIgnored, cmd, arg))
 			}
 		}
 		// help, exit, quit intercept
@@ -327,15 +326,13 @@ func (h *Handler) Run() error {
 				case h.batch && batch:
 					err = fmt.Errorf("cannot perform %s in existing batch", typ)
 					lastErr = WrapErr(h.buf.String(), err)
-					fmt.Fprintf(stderr, "error: %v", err)
-					fmt.Fprintln(stderr)
+					fmt.Fprintln(stderr, "error:", err)
 					continue
 				// cannot use \g* while accumulating statements for batch queries
 				case h.batch && typ != h.batchEnd && opt.Exec != metacmd.ExecNone:
 					err = errors.New("cannot force batch execution")
 					lastErr = WrapErr(h.buf.String(), err)
-					fmt.Fprintf(stderr, "error: %v", err)
-					fmt.Fprintln(stderr)
+					fmt.Fprintln(stderr, "error:", err)
 					continue
 				case batch:
 					h.batch, h.batchEnd = true, end
@@ -377,8 +374,7 @@ func (h *Handler) Run() error {
 				ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 				if err = h.Execute(ctx, out, opt, h.lastPrefix, h.last, forceBatch); err != nil {
 					lastErr = WrapErr(h.last, err)
-					fmt.Fprintf(stderr, "error: %v", err)
-					fmt.Fprintln(stderr)
+					fmt.Fprintln(stderr, "error:", err)
 				}
 				stop()
 			}
@@ -387,12 +383,12 @@ func (h *Handler) Run() error {
 }
 
 // Execute executes a query against the connected database.
-func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, qstr string, forceTrans bool) error {
+func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, forceTrans bool) error {
 	if h.db == nil {
 		return text.ErrNotConnected
 	}
 	// determine type and pre process string
-	prefix, qstr, qtyp, err := drivers.Process(h.u, prefix, qstr)
+	prefix, sqlstr, qtyp, err := drivers.Process(h.u, prefix, sqlstr)
 	if err != nil {
 		return drivers.WrapErr(h.u.Driver, err)
 	}
@@ -402,7 +398,7 @@ func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, 
 			return err
 		}
 	}
-	f := h.execOnly
+	f := h.execSingle
 	switch opt.Exec {
 	case metacmd.ExecExec:
 		f = h.execExec
@@ -411,7 +407,7 @@ func (h *Handler) Execute(ctx context.Context, w io.Writer, opt metacmd.Option, 
 	case metacmd.ExecWatch:
 		f = h.execWatch
 	}
-	if err = drivers.WrapErr(h.u.Driver, f(ctx, w, opt, prefix, qstr, qtyp)); err != nil {
+	if err = drivers.WrapErr(h.u.Driver, f(ctx, w, opt, prefix, sqlstr, qtyp)); err != nil {
 		if forceTrans {
 			defer h.tx.Rollback()
 			h.tx = nil
@@ -523,7 +519,6 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 	if h.tx != nil {
 		return text.ErrPreviousTransactionExists
 	}
-	var err error
 	if len(params) < 2 {
 		urlstr := params[0]
 		// parse dsn
@@ -554,7 +549,8 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 		}
 	}
 	// open connection
-	h.db, err = drivers.Open(h.u)
+	var err error
+	h.db, err = drivers.Open(h.u, h.GetOutput, h.IO().Stderr)
 	if err != nil && !drivers.IsPasswordErr(h.u, err) {
 		defer h.Close()
 		return err
@@ -564,7 +560,7 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 	// force error/check connection
 	if err == nil {
 		if err = drivers.Ping(ctx, h.u, h.db); err == nil {
-			h.l.Completer(drivers.NewCompleter(h.u, h.db, completer.WithConnStrings(connStrings)))
+			h.l.Completer(drivers.NewCompleter(ctx, h.u, h.db, readerOptions(), completer.WithConnStrings(connStrings)))
 			return h.Version(ctx)
 		}
 	}
@@ -574,8 +570,7 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 		return err
 	}
 	// print the error
-	fmt.Fprintf(h.l.Stderr(), "error: %v", err)
-	fmt.Fprintln(h.l.Stderr())
+	fmt.Fprintln(h.l.Stderr(), "error:", err)
 	// otherwise, try to collect a password ...
 	dsn, err := h.Password(params[0])
 	if err != nil {
@@ -588,45 +583,39 @@ func (h *Handler) Open(ctx context.Context, params ...string) error {
 }
 
 func (h *Handler) connStrings() []string {
-	available := drivers.Available()
-	entries, err := env.PassFileEntries(h.user)
+	entries, err := passfile.Entries(h.user, text.PassfileName)
 	if err != nil {
 		// ignore the error as this is only used for completer
 		// and it'll be reported again when trying to force params before opening a conn
 		entries = nil
 	}
+	available := drivers.Available()
 	names := make([]string, 0, len(available)+len(entries))
-
 	for schema := range available {
 		_, aliases := dburl.SchemeDriverAndAliases(schema)
 		// TODO should we create all combinations of space, :, :// and +transport ?
 		names = append(names, schema)
 		names = append(names, aliases...)
 	}
-
-	for _, e := range entries {
-		if e.Protocol == "*" {
+	for _, entry := range entries {
+		if entry.Protocol == "*" {
 			continue
 		}
-		user := ""
-		host := ""
-		port := ""
-		dbname := ""
-		if e.Username != "*" {
-			user = e.Username + "@"
-			if e.Host != "*" {
-				host = e.Host
-				if e.Port != "*" {
-					port = ":" + e.Port
+		user, host, port, dbname := "", "", "", ""
+		if entry.Username != "*" {
+			user = entry.Username + "@"
+			if entry.Host != "*" {
+				host = entry.Host
+				if entry.Port != "*" {
+					port = ":" + entry.Port
 				}
-				if e.DBName != "*" {
-					dbname = "/" + e.DBName
+				if entry.DBName != "*" {
+					dbname = "/" + entry.DBName
 				}
 			}
 		}
-		names = append(names, fmt.Sprintf("%s://%s%s%s%s", e.Protocol, user, host, port, dbname))
+		names = append(names, fmt.Sprintf("%s://%s%s%s%s", entry.Protocol, user, host, port, dbname))
 	}
-
 	sort.Strings(names)
 	return names
 }
@@ -638,12 +627,10 @@ func (h *Handler) forceParams(u *dburl.URL) {
 	// force driver parameters
 	drivers.ForceParams(u)
 	// see if password entry is present
-	user, err := env.PassFileMatch(h.user, u)
+	user, err := passfile.Match(h.user, u, text.PassfileName)
 	switch {
 	case err != nil:
-		errout := h.l.Stderr()
-		fmt.Fprintf(errout, "error: %v", err)
-		fmt.Fprintln(errout)
+		fmt.Fprintln(h.l.Stderr(), "error:", err)
 	case user != nil:
 		u.User = user
 	}
@@ -800,27 +787,17 @@ func (h *Handler) Print(format string, a ...interface{}) {
 	if env.Get("QUIET") == "on" {
 		return
 	}
-	out := h.l.Stdout()
-	fmt.Fprintf(out, format, a...)
-	fmt.Fprintln(out)
-}
-
-// timefmt returns the current time format setting.
-func (h *Handler) timefmt() string {
-	s := env.Timefmt()
-	if s == "" {
-		s = time.RFC3339Nano
-	}
-	return s
+	fmt.Fprintln(h.l.Stdout(), fmt.Sprintf(format, a...))
 }
 
 // execWatch repeatedly executes a query against the database.
-func (h *Handler) execWatch(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, qstr string, qtyp bool) error {
+func (h *Handler) execWatch(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, qtyp bool) error {
 	for {
 		// this is the actual output that psql has: "Mon Jan 2006 3:04:05 PM MST"
 		// fmt.Fprintf(w, "%s (every %fs)\n\n", time.Now().Format("Mon Jan 2006 3:04:05 PM MST"), float64(opt.Watch)/float64(time.Second))
-		fmt.Fprintf(w, "%s (every %v)\n\n", time.Now().Format(time.RFC1123), opt.Watch)
-		if err := h.execOnly(ctx, w, opt, prefix, qstr, qtyp); err != nil {
+		fmt.Fprintln(w, fmt.Sprintf("%s (every %v)", time.Now().Format(time.RFC1123), opt.Watch))
+		fmt.Fprintln(w)
+		if err := h.execSingle(ctx, w, opt, prefix, sqlstr, qtyp); err != nil {
 			return err
 		}
 		select {
@@ -834,36 +811,36 @@ func (h *Handler) execWatch(ctx context.Context, w io.Writer, opt metacmd.Option
 	}
 }
 
-// execOnly executes a query against the database.
-func (h *Handler) execOnly(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, qstr string, qtyp bool) error {
+// execSingle executes a single query against the database based on its query type.
+func (h *Handler) execSingle(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, qtyp bool) error {
 	// exec or query
 	f := h.exec
 	if qtyp {
 		f = h.query
 	}
 	// exec
-	return f(ctx, w, opt, prefix, qstr)
+	return f(ctx, w, opt, prefix, sqlstr)
 }
 
 // execSet executes a SQL query, setting all returned columns as variables.
-func (h *Handler) execSet(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, qstr string, _ bool) error {
+func (h *Handler) execSet(ctx context.Context, w io.Writer, opt metacmd.Option, prefix, sqlstr string, _ bool) error {
 	// query
-	q, err := h.DB().QueryContext(ctx, qstr)
+	rows, err := h.DB().QueryContext(ctx, sqlstr)
 	if err != nil {
 		return err
 	}
 	// get cols
-	cols, err := drivers.Columns(h.u, q)
+	cols, err := drivers.Columns(h.u, rows)
 	if err != nil {
 		return err
 	}
 	// process row(s)
 	var i int
 	var row []string
-	clen, tfmt := len(cols), h.timefmt()
-	for q.Next() {
+	clen, tfmt := len(cols), env.GoTime()
+	for rows.Next() {
 		if i == 0 {
-			row, err = h.scan(q, clen, tfmt)
+			row, err = h.scan(rows, clen, tfmt)
 			if err != nil {
 				return err
 			}
@@ -886,21 +863,19 @@ func (h *Handler) execSet(ctx context.Context, w io.Writer, opt metacmd.Option, 
 
 // execExec executes a query and re-executes all columns of all rows as if they
 // were their own queries.
-func (h *Handler) execExec(ctx context.Context, w io.Writer, _ metacmd.Option, prefix, qstr string, qtyp bool) error {
+func (h *Handler) execExec(ctx context.Context, w io.Writer, _ metacmd.Option, prefix, sqlstr string, qtyp bool) error {
 	// query
-	q, err := h.DB().QueryContext(ctx, qstr)
+	rows, err := h.DB().QueryContext(ctx, sqlstr)
 	if err != nil {
 		return err
 	}
 	// execRows
-	err = h.execRows(ctx, w, q)
-	if err != nil {
+	if err := h.execRows(ctx, w, rows); err != nil {
 		return err
 	}
 	// check for additional result sets ...
-	for drivers.NextResultSet(q) {
-		err = h.execRows(ctx, w, q)
-		if err != nil {
+	for rows.NextResultSet() {
+		if err := h.execRows(ctx, w, rows); err != nil {
 			return err
 		}
 	}
@@ -908,19 +883,21 @@ func (h *Handler) execExec(ctx context.Context, w io.Writer, _ metacmd.Option, p
 }
 
 // query executes a query against the database.
-func (h *Handler) query(ctx context.Context, w io.Writer, opt metacmd.Option, _, qstr string) error {
+func (h *Handler) query(ctx context.Context, w io.Writer, opt metacmd.Option, typ, sqlstr string) error {
 	start := time.Now()
 	// run query
-	q, err := h.DB().QueryContext(ctx, qstr)
+	rows, err := h.DB().QueryContext(ctx, sqlstr)
 	if err != nil {
 		return err
 	}
-	defer q.Close()
+	defer rows.Close()
 	params := env.Pall()
+	params["time"] = env.GoTime()
 	for k, v := range opt.Params {
 		params[k] = v
 	}
 	var pipe io.WriteCloser
+	var cmd *exec.Cmd
 	if pipeName := params["pipe"]; pipeName != "" || h.out != nil {
 		if params["expanded"] == "auto" && params["columns"] == "" {
 			// don't rely on terminal size when piping output to a file or cmd
@@ -928,7 +905,7 @@ func (h *Handler) query(ctx context.Context, w io.Writer, opt metacmd.Option, _,
 		}
 		if pipeName != "" {
 			if pipeName[0] == '|' {
-				pipe, err = env.Pipe(pipeName[1:])
+				pipe, cmd, err = env.Pipe(pipeName[1:])
 			} else {
 				pipe, err = os.OpenFile(pipeName, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0o644)
 			}
@@ -940,16 +917,30 @@ func (h *Handler) query(ctx context.Context, w io.Writer, opt metacmd.Option, _,
 	} else {
 		params["pager_cmd"] = env.All()["PAGER"]
 	}
+	useColumnTypes := drivers.UseColumnTypes(h.u)
 	// wrap query with crosstab
-	resultSet := tblfmt.ResultSet(q)
+	resultSet := tblfmt.ResultSet(rows)
 	if opt.Exec == metacmd.ExecCrosstab {
 		var err error
-		resultSet, err = tblfmt.NewCrosstabView(q, tblfmt.WithParams(opt.Crosstab...))
+		resultSet, err = tblfmt.NewCrosstabView(rows, tblfmt.WithParams(opt.Crosstab...), tblfmt.WithUseColumnTypes(useColumnTypes))
 		if err != nil {
 			return err
 		}
+		useColumnTypes = false
 	}
-	if err = tblfmt.EncodeAll(w, resultSet, params); err != nil {
+	if useColumnTypes {
+		params["use_column_types"] = "true"
+	}
+	// encode and handle error conditions
+	switch err := tblfmt.EncodeAll(w, resultSet, params); {
+	case err != nil && cmd != nil && errors.Is(err, syscall.EPIPE):
+		// broken pipe means pager quit before consuming all data, which might be expected
+		return nil
+	case err != nil && h.u.Driver == "sqlserver" && err == tblfmt.ErrResultSetHasNoColumns && strings.HasPrefix(typ, "EXEC"):
+		// sqlserver EXEC statements sometimes do not have results, fake that
+		// it was executed as a exec and not a query
+		fmt.Fprintln(w, typ)
+	case err != nil:
 		return err
 	}
 	if h.timing {
@@ -963,30 +954,33 @@ func (h *Handler) query(ctx context.Context, w io.Writer, opt metacmd.Option, _,
 		h.Print(format, a)
 	}
 	if pipe != nil {
-		return pipe.Close()
+		pipe.Close()
+		if cmd != nil {
+			cmd.Wait()
+		}
 	}
 	return err
 }
 
 // execRows executes all the columns in the row.
-func (h *Handler) execRows(ctx context.Context, w io.Writer, q *sql.Rows) error {
+func (h *Handler) execRows(ctx context.Context, w io.Writer, rows *sql.Rows) error {
 	// get columns
-	cols, err := drivers.Columns(h.u, q)
+	cols, err := drivers.Columns(h.u, rows)
 	if err != nil {
 		return err
 	}
 	// process rows
 	res := metacmd.Option{Exec: metacmd.ExecOnly}
-	clen, tfmt := len(cols), h.timefmt()
-	for q.Next() {
+	clen, tfmt := len(cols), env.GoTime()
+	for rows.Next() {
 		if clen != 0 {
-			row, err := h.scan(q, clen, tfmt)
+			row, err := h.scan(rows, clen, tfmt)
 			if err != nil {
 				return err
 			}
 			// execute
-			for _, qstr := range row {
-				if err = h.Execute(ctx, w, res, stmt.FindPrefix(qstr), qstr, false); err != nil {
+			for _, sqlstr := range row {
+				if err = h.Execute(ctx, w, res, stmt.FindPrefix(sqlstr), sqlstr, false); err != nil {
 					return err
 				}
 			}
@@ -996,14 +990,13 @@ func (h *Handler) execRows(ctx context.Context, w io.Writer, q *sql.Rows) error 
 }
 
 // scan scans a row.
-func (h *Handler) scan(q *sql.Rows, clen int, tfmt string) ([]string, error) {
-	var err error
+func (h *Handler) scan(rows *sql.Rows, clen int, tfmt string) ([]string, error) {
 	// scan to []interface{}
 	r := make([]interface{}, clen)
 	for i := range r {
 		r[i] = new(interface{})
 	}
-	if err = q.Scan(r...); err != nil {
+	if err := rows.Scan(r...); err != nil {
 		return nil, err
 	}
 	// get conversion funcs
@@ -1014,8 +1007,8 @@ func (h *Handler) scan(q *sql.Rows, clen int, tfmt string) ([]string, error) {
 		switch x := (*j).(type) {
 		case []byte:
 			if x != nil {
-				row[n], err = cb(x, tfmt)
-				if err != nil {
+				var err error
+				if row[n], err = cb(x, tfmt); err != nil {
 					return nil, err
 				}
 			}
@@ -1027,33 +1020,33 @@ func (h *Handler) scan(q *sql.Rows, clen int, tfmt string) ([]string, error) {
 			row[n] = x.String()
 		case map[string]interface{}:
 			if x != nil {
-				row[n], err = cm(x)
-				if err != nil {
+				var err error
+				if row[n], err = cm(x); err != nil {
 					return nil, err
 				}
 			}
 		case []interface{}:
 			if x != nil {
-				row[n], err = cs(x)
-				if err != nil {
+				var err error
+				if row[n], err = cs(x); err != nil {
 					return nil, err
 				}
 			}
 		default:
 			if x != nil {
-				row[n], err = cd(x)
-				if err != nil {
+				var err error
+				if row[n], err = cd(x); err != nil {
 					return nil, err
 				}
 			}
 		}
 	}
-	return row, err
+	return row, nil
 }
 
 // exec does a database exec.
-func (h *Handler) exec(ctx context.Context, w io.Writer, _ metacmd.Option, typ, qstr string) error {
-	res, err := h.DB().ExecContext(ctx, qstr)
+func (h *Handler) exec(ctx context.Context, w io.Writer, _ metacmd.Option, typ, sqlstr string) error {
+	res, err := h.DB().ExecContext(ctx, sqlstr)
 	if err != nil {
 		_ = env.Set("ROW_COUNT", "0")
 		return err
@@ -1165,10 +1158,15 @@ func (h *Handler) Include(path string, relative bool) error {
 }
 
 // MetadataWriter loads the metadata writer for the
-func (h *Handler) MetadataWriter() (metadata.Writer, error) {
+func (h *Handler) MetadataWriter(ctx context.Context) (metadata.Writer, error) {
 	if h.db == nil {
 		return nil, text.ErrNotConnected
 	}
+	opts := readerOptions()
+	return drivers.NewMetadataWriter(ctx, h.u, h.db, h.l.Stdout(), opts...)
+}
+
+func readerOptions() []metadata.ReaderOption {
 	var opts []metadata.ReaderOption
 	envs := env.All()
 	if envs["ECHO_HIDDEN"] == "on" || envs["ECHO_HIDDEN"] == "noexec" {
@@ -1181,15 +1179,21 @@ func (h *Handler) MetadataWriter() (metadata.Writer, error) {
 			metadata.WithTimeout(30*time.Second),
 		)
 	}
-	return drivers.NewMetadataWriter(h.u, h.db, h.l.Stdout(), opts...)
+	return opts
 }
 
 // GetOutput gets the output writer.
-func (h *Handler) GetOutput() io.WriteCloser {
+func (h *Handler) GetOutput() io.Writer {
+	if h.out == nil {
+		return h.l.Stdout()
+	}
 	return h.out
 }
 
 // SetOutput sets the output writer.
 func (h *Handler) SetOutput(o io.WriteCloser) {
+	if h.out != nil {
+		h.out.Close()
+	}
 	h.out = o
 }

@@ -11,7 +11,7 @@ import (
 	"regexp"
 	"strings"
 
-	_ "github.com/sijms/go-ora" // DRIVER: oracle
+	_ "github.com/sijms/go-ora" // DRIVER
 	"github.com/xo/dburl"
 	"github.com/xo/usql/drivers"
 	"github.com/xo/usql/drivers/metadata"
@@ -23,6 +23,7 @@ import (
 func init() {
 	allCapsRE := regexp.MustCompile(`^[A-Z][A-Z0-9_]+$`)
 	endRE := regexp.MustCompile(`;?\s*$`)
+	endAnchorRE := regexp.MustCompile(`(?i)\send\s*;\s*$`)
 	drivers.Register("oracle", drivers.Driver{
 		AllowMultilineComments: true,
 		ForceParams: func(u *dburl.URL) {
@@ -104,7 +105,10 @@ func init() {
 			return cols, nil
 		},
 		Process: func(prefix string, sqlstr string) (string, string, bool, error) {
-			sqlstr = endRE.ReplaceAllString(sqlstr, "")
+			if !endAnchorRE.MatchString(sqlstr) {
+				// trim last ; but only when not END;
+				sqlstr = endRE.ReplaceAllString(sqlstr, "")
+			}
 			typ, q := drivers.QueryExecType(prefix, sqlstr)
 			return typ, sqlstr, q, nil
 		},
@@ -112,5 +116,6 @@ func init() {
 		NewMetadataWriter: func(db drivers.DB, w io.Writer, opts ...metadata.ReaderOption) metadata.Writer {
 			return metadata.NewDefaultWriter(orameta.NewReader()(db, opts...))(db, w)
 		},
+		Copy: drivers.CopyWithInsert(func(n int) string { return fmt.Sprintf(":%d", n) }),
 	})
 }

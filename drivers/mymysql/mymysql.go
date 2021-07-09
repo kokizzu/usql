@@ -7,7 +7,7 @@ import (
 	"strconv"
 
 	"github.com/xo/usql/drivers"
-	_ "github.com/ziutek/mymysql/godrv" // DRIVER: mymysql
+	_ "github.com/ziutek/mymysql/godrv" // DRIVER
 	"github.com/ziutek/mymysql/mysql"
 )
 
@@ -16,6 +16,7 @@ func init() {
 		AllowMultilineComments: true,
 		AllowHashComments:      true,
 		LexerName:              "mysql",
+		UseColumnTypes:         true,
 		Err: func(err error) (string, string) {
 			if e, ok := err.(*mysql.Error); ok {
 				return strconv.Itoa(int(e.Code)), string(e.Msg)
@@ -28,5 +29,6 @@ func init() {
 			}
 			return false
 		},
+		Copy: drivers.CopyWithInsert(func(int) string { return "?" }),
 	})
 }

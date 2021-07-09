@@ -53,7 +53,7 @@ func isEmptyLine(r []rune, i, end int) bool {
 }
 
 // identifierRE is a regexp that matches dollar tag identifiers ($tag$).
-var identifierRE = regexp.MustCompile(`(?i)^[a-z][a-z0-9_]{0,127}$`)
+var identifierRE = regexp.MustCompile(`(?i)^[a-z_][a-z0-9_]{0,127}$`)
 
 // readDollarAndTag reads a dollar style $tag$ in r, starting at i, returning
 // the enclosed "tag" and position, or -1 if the dollar and tag was invalid.
@@ -80,8 +80,8 @@ func readDollarAndTag(r []rune, i, end int) (string, int, bool) {
 	return id, i, true
 }
 
-// readString seeks to the end of a string (depending on the state of b)
-// returning the position and whether or not the string's end was found.
+// readString seeks to the end of a string returning the position and whether
+// or not the string's end was found.
 //
 // If the string's terminator was not found, then the result will be the passed
 // end.
@@ -90,7 +90,13 @@ func readString(r []rune, i, end int, quote rune, tag string) (int, bool) {
 	for ; i < end; i++ {
 		c, next = r[i], grab(r, i+1, end)
 		switch {
+		case quote == '\'' && c == '\\':
+			i++
+			prev = 0
+			continue
 		case quote == '\'' && c == '\'' && next == '\'':
+			i++
+			continue
 		case quote == '\'' && c == '\'' && prev != '\'',
 			quote == '"' && c == '"',
 			quote == '`' && c == '`':

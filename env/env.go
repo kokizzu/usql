@@ -3,22 +3,20 @@
 package env
 
 import (
-	"bufio"
 	"bytes"
-	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/xo/dburl"
+	"github.com/xo/dburl/passfile"
 	"github.com/xo/usql/text"
 	"github.com/zaf/temp"
 )
@@ -33,23 +31,11 @@ func Getenv(keys ...string) string {
 	return ""
 }
 
-// Expand expands the tilde (~) in the front of a path to a the supplied
-// directory.
-func Expand(u *user.User, path string) string {
-	switch {
-	case path == "~":
-		return u.HomeDir
-	case strings.HasPrefix(path, "~/"):
-		return filepath.Join(u.HomeDir, strings.TrimPrefix(path, "~/"))
-	}
-	return path
-}
-
 // Chdir changes the current working directory to the specified path, or to the
 // user's home directory if path is not specified.
 func Chdir(u *user.User, path string) error {
 	if path != "" {
-		path = Expand(u, path)
+		path = passfile.Expand(u, path)
 	} else {
 		path = u.HomeDir
 	}
@@ -59,7 +45,7 @@ func Chdir(u *user.User, path string) error {
 // OpenFile opens a file for reading, returning the full, expanded path of the
 // file.  All callers are responsible for closing the returned file.
 func OpenFile(u *user.User, path string, relative bool) (string, *os.File, error) {
-	path, err := filepath.EvalSymlinks(Expand(u, path))
+	path, err := filepath.EvalSymlinks(passfile.Expand(u, path))
 	switch {
 	case err != nil && os.IsNotExist(err):
 		return "", nil, text.ErrNoSuchFileOrDirectory
@@ -89,7 +75,7 @@ func EditFile(u *user.User, path, line, s string) ([]rune, error) {
 		return nil, text.ErrNoEditorDefined
 	}
 	if path != "" {
-		path = Expand(u, path)
+		path = passfile.Expand(u, path)
 	} else {
 		f, err := temp.File("", text.CommandLower(), "sql")
 		if err != nil {
@@ -141,7 +127,7 @@ func HistoryFile(u *user.User) string {
 	if s := Getenv(n); s != "" {
 		path = s
 	}
-	return Expand(u, path)
+	return passfile.Expand(u, path)
 }
 
 // RCFile returns the path to the RC file.
@@ -154,130 +140,7 @@ func RCFile(u *user.User) string {
 	if s := Getenv(n); s != "" {
 		path = s
 	}
-	return Expand(u, path)
-}
-
-// PassFile returns the path to the password file.
-//
-// Defaults to ~/.<command name>pass, overridden by environment variable
-// <COMMAND NAME>PASS (ie, ~/.usqlpass and USQLPASS).
-func PassFile(u *user.User) string {
-	n := text.CommandUpper() + "PASS"
-	path := "~/." + strings.ToLower(n)
-	if s := Getenv(n); s != "" {
-		path = s
-	}
-	return Expand(u, path)
-}
-
-// PassFileMatch returns a Userinfo from a passfile entry matching
-// the database URL.
-func PassFileMatch(u *user.User, v *dburl.URL) (*url.Userinfo, error) {
-	// check if v already has password defined ...
-	var username string
-	if v.User != nil {
-		username = v.User.Username()
-		if _, ok := v.User.Password(); ok {
-			return nil, nil
-		}
-	}
-	entries, err := readPassEntries(PassFile(u))
-	if err != nil || entries == nil {
-		return nil, err
-	}
-	// find matching entry
-	n := strings.SplitN(v.Normalize(":", "", 3), ":", 6)
-	if len(n) < 3 {
-		return nil, errors.New("unknown error encountered normalizing URL")
-	}
-	m := newPassFileEntry(n)
-	for _, entry := range entries {
-		if entry.equal(m) {
-			u := entry.Username
-			if entry.Username == "*" {
-				u = username
-			}
-			return url.UserPassword(u, entry.Password), nil
-		}
-	}
-	return nil, nil
-}
-
-func PassFileEntries(u *user.User) ([]PassFileEntry, error) {
-	return readPassEntries(PassFile(u))
-}
-
-// commentRE matches comment entries in a pass file.
-var commentRE = regexp.MustCompile(`#.*`)
-
-// readPassEntries reads the pass file entries from path.
-func readPassEntries(path string) ([]PassFileEntry, error) {
-	// check if pass file exists
-	fi, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	// check pass file is not directory
-	if fi.IsDir() {
-		return nil, fmt.Errorf(text.BadPassFile, path)
-	}
-	// check pass file is not group/world readable/writable/executable
-	if runtime.GOOS != "windows" && fi.Mode()&0x3f != 0 {
-		return nil, fmt.Errorf(text.BadPassFileMode, path)
-	}
-
-	f, err := os.OpenFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var entries []PassFileEntry
-	s := bufio.NewScanner(f)
-	i := 0
-	for s.Scan() {
-		i++
-		// grab next line
-		line := strings.TrimSpace(commentRE.ReplaceAllString(s.Text(), ""))
-		if line == "" {
-			continue
-		}
-		// split and check length
-		v := strings.Split(line, ":")
-		if len(v) != 6 {
-			return nil, fmt.Errorf(text.BadPassFileLine, i)
-		}
-		// make sure no blank entries exist
-		for j := 0; j < len(v); j++ {
-			if v[j] == "" {
-				return nil, fmt.Errorf(text.BadPassFileFieldEmpty, i, j)
-			}
-		}
-		entries = append(entries, newPassFileEntry(v))
-	}
-	return entries, nil
-}
-
-type PassFileEntry struct {
-	Protocol, Host, Port, DBName, Username, Password string
-}
-
-func newPassFileEntry(v []string) PassFileEntry {
-	// make sure there's always at least 6 elements
-	v = append(v, "", "", "", "", "", "")
-	return PassFileEntry{
-		Protocol: v[0],
-		Host:     v[1],
-		Port:     v[2],
-		DBName:   v[3],
-		Username: v[4],
-		Password: v[5],
-	}
-}
-
-func (e PassFileEntry) equal(b PassFileEntry) bool {
-	return (e.Protocol == "*" || e.Protocol == b.Protocol) &&
-		(e.Host == "*" || e.Host == b.Host) &&
-		(e.Port == "*" || e.Port == b.Port)
+	return passfile.Expand(u, path)
 }
 
 // Getshell returns the user's defined SHELL, or system default (if found on
@@ -311,32 +174,35 @@ func Getshell() (string, string) {
 // Shell runs s as a shell. When s is empty the user's SHELL or COMSPEC is
 // used. See Getshell.
 func Shell(s string) error {
-	if s = strings.TrimSpace(s); s == "" {
-		s, _ = Getshell()
-		if s == "" {
-			return text.ErrNoShellAvailable
-		}
+	shell, param := Getshell()
+	if shell == "" {
+		return text.ErrNoShellAvailable
+	}
+	s = strings.TrimSpace(s)
+	var params []string
+	if s != "" {
+		params = append(params, param, s)
 	}
 	// drop to shell
-	cmd := exec.Command(s)
+	cmd := exec.Command(shell, params...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	_ = cmd.Run()
 	return nil
 }
 
 // Pipe starts a command and returns its input for writing.
-func Pipe(c string) (io.WriteCloser, error) {
+func Pipe(c string) (io.WriteCloser, *exec.Cmd, error) {
 	shell, param := Getshell()
 	if shell == "" {
-		return nil, text.ErrNoShellAvailable
+		return nil, nil, text.ErrNoShellAvailable
 	}
 	cmd := exec.Command(shell, param, c)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	out, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, cmd.Start()
+	return out, cmd, cmd.Start()
 }
 
 // Exec executes s using the user's SHELL / COMSPEC with -c (or /c) and
@@ -363,18 +229,38 @@ func Exec(s string) (string, error) {
 	return string(buf), nil
 }
 
-var cleanDoubleRE = regexp.MustCompile(`''`)
+var cleanDoubleRE = regexp.MustCompile(`(^|[^\\])''`)
 
 // Dequote unquotes a string.
-func Dequote(s string, c byte) (string, error) {
-	if len(s) < 2 || s[len(s)-1] != c {
+func Dequote(s string, quote byte) (string, error) {
+	if len(s) < 2 || s[len(s)-1] != quote {
 		return "", text.ErrUnterminatedQuotedString
 	}
 	s = s[1 : len(s)-1]
-	if c != '\'' {
-		return s, nil
+	if quote == '\'' {
+		s = cleanDoubleRE.ReplaceAllString(s, "$1\\'")
 	}
-	return cleanDoubleRE.ReplaceAllString(s, "'"), nil
+
+	// this is the last part of strconv.Unquote
+	var runeTmp [utf8.UTFMax]byte
+	buf := make([]byte, 0, 3*len(s)/2) // Try to avoid more allocations.
+	for len(s) > 0 {
+		c, multibyte, ss, err := strconv.UnquoteChar(s, quote)
+		switch {
+		case err != nil && err == strconv.ErrSyntax:
+			return "", text.ErrInvalidQuotedString
+		case err != nil:
+			return "", err
+		}
+		s = ss
+		if c < utf8.RuneSelf || !multibyte {
+			buf = append(buf, byte(c))
+		} else {
+			n := utf8.EncodeRune(runeTmp[:], c)
+			buf = append(buf, runeTmp[:n]...)
+		}
+	}
+	return string(buf), nil
 }
 
 // Getvar retrieves an environment variable.

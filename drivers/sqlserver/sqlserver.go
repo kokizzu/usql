@@ -10,16 +10,17 @@ import (
 	"strconv"
 	"strings"
 
-	sqlserver "github.com/denisenkom/go-mssqldb" // DRIVER: sqlserver
+	sqlserver "github.com/denisenkom/go-mssqldb" // DRIVER
 	"github.com/xo/usql/drivers"
 	"github.com/xo/usql/drivers/metadata"
 	infos "github.com/xo/usql/drivers/metadata/informationschema"
 )
 
 func init() {
+	placeholder := func(n int) string { return fmt.Sprintf("@p%d", n) }
 	newReader := func(db drivers.DB, opts ...metadata.ReaderOption) metadata.Reader {
 		ir := infos.New(
-			infos.WithPlaceholder(func(n int) string { return fmt.Sprintf("@p%d", n) }),
+			infos.WithPlaceholder(placeholder),
 			infos.WithIndexes(false),
 			infos.WithSequences(false),
 			infos.WithConstraints(false),
@@ -82,5 +83,6 @@ func init() {
 		NewMetadataWriter: func(db drivers.DB, w io.Writer, opts ...metadata.ReaderOption) metadata.Writer {
 			return metadata.NewDefaultWriter(newReader(db, opts...))(db, w)
 		},
+		Copy: drivers.CopyWithInsert(placeholder),
 	})
 }
